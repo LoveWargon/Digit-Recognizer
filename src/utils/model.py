@@ -111,7 +111,7 @@ datagen.fit(x_train_split)
 print("Начинаем обучение...")
 history = model.fit(
     datagen.flow(x_train_split, y_train_split, batch_size=128),
-    epochs=300, # 200
+    epochs=200, # 200
     validation_data=(x_val, y_val),
     callbacks=callbacks,
     verbose=1
@@ -156,6 +156,11 @@ project_root = get_project_root()
 model_save_path = os.path.join(project_root, "src", "resources", "models", "improved_digit_recognition_model.h5")
 model.save(model_save_path)
 print(f"Модель сохранена как '{model_save_path}'")
+
+# Сохраняем модель в формате Keras
+keras_save_path = os.path.join(project_root, "src", "resources", "models", "improved_digit_recognition_model.keras")
+model.save(keras_save_path)
+print(f"Модель сохранена в формате Keras как '{keras_save_path}'")
 
 # Также сохраняем в формате SavedModel
 savedmodel_path = os.path.join(project_root, "src", "resources", "models", "improved_digit_recognition_model_savedmodel")
