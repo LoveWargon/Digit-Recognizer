@@ -1,1335 +1,1239 @@
 import sys
-import tkinter as tk
-from tkinter import messagebox, ttk
+import os
+import io
+from typing import Optional, Tuple
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 import onnxruntime as ort
 import cv2
 from scipy import ndimage
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import threading
-import os
 
-def resource_path(relative_path):
-    """Получение пути к ресурсу, работает для dev и для PyInstaller"""
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
+    QHBoxLayout, QSlider, QFrame, QMessageBox, QProgressBar,
+    QDialog, QGraphicsOpacityEffect, QGroupBox, QSizePolicy, QGridLayout,
+    QGraphicsDropShadowEffect
+)
+from PySide6.QtCore import Qt, QThread, Signal, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QMargins
+from PySide6.QtGui import (
+    QPainter, QPen, QColor, QImage, QPixmap, QIcon, QKeySequence, QFont, QShortcut, QLinearGradient # Добавлено QLinearGradient
+)
+# Qt Charts
+from PySide6.QtCharts import QChart, QChartView, QBarSeries, QBarSet, QBarCategoryAxis, QValueAxis
+
+# ---------- Helper ----------
+def resource_path(relative_path: str) -> str:
     try:
-        # PyInstaller создает временную папку _MEIPASS
-        base_path = sys._MEIPASS
-        # Для PyInstaller: файлы добавлены с префиксом 'src'
-        # Поэтому добавляем 'src' к относительному пути для поиска внутри _MEIPASS
-        relative_path = os.path.join('src', relative_path)
+        base_path = sys._MEIPASS  # type: ignore
+        rel = os.path.join('src', relative_path)
     except Exception:
-        # Для разработки: файлы ищем относительно текущей директории проекта
         base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+        rel = relative_path
+    return os.path.join(base_path, rel)
 
+# ---------- Worker ----------
+# Используем улучшенную версию из второго файла
+class InferenceWorker(QThread):
+    result_ready = Signal(np.ndarray)
+    error = Signal(str)
 
+    def __init__(self, session: ort.InferenceSession, img_array: np.ndarray):
+        super().__init__()
+        self.session = session
+        self.img = img_array.astype(np.float32)
 
-class ModernDigitRecognizer:
+    def run(self):
+        try:
+            name = self.session.get_inputs()[0].name
+            outs = self.session.run(None, {name: self.img})
+            # Берём первый тензор выхода и аккуратно приводим к форме (n_classes,)
+            out = outs[0]
+            if hasattr(out, "shape") and out.ndim > 1:
+                out = out[0]
+            out = np.asarray(out).astype(np.float32)
+            # Нормализуем (на всякий случай), если суммы не 1
+            if out.sum() > 0:
+                out = out / out.sum()
+            self.result_ready.emit(out)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ---------- Drawing Widget ----------
+# Используем UI версию из первого файла
+class DrawingWidget(QWidget):
+    def __init__(self, size: int = 280, brush: int = 12):
+        super().__init__()
+        self.setFixedSize(size, size)
+        self.size_px = size
+        self.brush_size = brush
+        self.pen_color = QColor("black")
+        self._image = QImage(self.size_px, self.size_px, QImage.Format_Grayscale8)
+        self.clear()
+        self.last_pos = None
+        self.setCursor(Qt.CrossCursor)
+        # Добавляем рамку для визуального выделения холста
+        self.setStyleSheet("border: 2px solid #4a90e2; border-radius: 8px;")
+
+    def clear(self):
+        self._image.fill(255)
+        self.update()
+
+    def set_brush(self, size: int):
+        self.brush_size = max(1, int(size))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        pix = QPixmap.fromImage(self._image)
+        p.drawPixmap(0, 0, pix)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.last_pos = event.position() if hasattr(event, 'position') else event.pos()
+            self._draw_point(self.last_pos)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self.last_pos is not None:
+            pos = event.position() if hasattr(event, 'position') else event.pos()
+            self._draw_line(self.last_pos, pos)
+            self.last_pos = pos
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.last_pos = None
+
+    def _draw_point(self, pos):
+        painter = QPainter(self._image)
+        pen = QPen(self.pen_color, self.brush_size, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        x, y = int(pos.x()), int(pos.y())
+        painter.drawPoint(x, y)
+        painter.end()
+
+    def _draw_line(self, p1, p2):
+        painter = QPainter(self._image)
+        pen = QPen(self.pen_color, self.brush_size, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(int(p1.x()), int(p1.y()), int(p2.x()), int(p2.y()))
+        painter.end()
+
+    def get_pil_image(self) -> Image.Image:
+        buffer = QByteArray()
+        buf = QBuffer(buffer)
+        buf.open(QIODevice.WriteOnly)
+        self._image.save(buf, "PNG")
+        buf.close()
+        pil_img = Image.open(io.BytesIO(buffer.data()))
+        if pil_img.mode != "L":
+            pil_img = pil_img.convert("L")
+        return pil_img
+
+# ---------- Theme transition overlay ----------
+# Используем улучшенную версию из второго файла
+class ThemeTransitionOverlay(QWidget):
+    """Полупрозрачный оверлей с градиентом, который мы показываем/скрываем при смене темы."""
+    def __init__(self, parent: QWidget, start_color: str, end_color: str):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setGeometry(parent.rect())
+        # Используем стиль градиента от start_color до end_color
+        self.setStyleSheet(f"""
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 {start_color}, stop:1 {end_color});
+        """)
+        self._opacity = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity)
+        self._opacity.setOpacity(0.0)
+        self.show()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.setGeometry(self.parent().rect())
+
+# ---------- Probability Dialog ----------
+# Используем улучшенную UI версию из первого файла
+class ProbabilityDialog(QDialog):
+    def __init__(self, probabilities: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Вероятности предсказаний")
+        self.resize(750, 500)
+        self.setModal(True)
+        # Добавляем декоративные элементы
+        self.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2c3e50, stop:1 #1a2530);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #ecf0f1;
+                font-family: "Segoe UI", Arial;
+            }
+        """)
+
+        # Основной layout
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+
+        # Заголовок с декорацией
+        header = QLabel("Распределение вероятностей")
+        header.setStyleSheet("""
+            QLabel {
+                color: #3498db;
+                font-size: 20px;
+                font-weight: bold;
+                padding: 12px;
+                background: rgba(0, 0, 0, 0.3);
+                border-radius: 8px;
+                border: 1px solid #3498db;
+            }
+        """)
+        header.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(header)
+
+        # Создаем график
+        chart = QChart()
+        chart.setBackgroundRoundness(0)
+        chart.setMargins(QMargins(0, 0, 0, 0))
+        chart.setAnimationOptions(QChart.SeriesAnimations)
+
+        # Создаем серии данных
+        series = QBarSeries()
+        max_idx = int(np.argmax(probabilities))
+
+        # Создаем отдельные наборы для каждой цифры
+        bar_sets = []
+        for i, p in enumerate(probabilities):
+            bar_set = QBarSet(str(i))
+            bar_set.append(float(p))
+            # === Улучшенная цветовая схема с градиентами ===
+            if i == max_idx:
+                # Зеленый градиент для максимального значения
+                gradient = QLinearGradient(0, 0, 0, 400)
+                gradient.setColorAt(0, QColor("#27ae60"))
+                gradient.setColorAt(1, QColor("#1e8449"))
+                bar_set.setBrush(gradient)
+                bar_set.setBorderColor(QColor("#2ecc71"))
+            elif p > 0.3:
+                # Синий градиент для высоких значений
+                gradient = QLinearGradient(0, 0, 0, 400)
+                gradient.setColorAt(0, QColor("#3498db"))
+                gradient.setColorAt(1, QColor("#2874a6"))
+                bar_set.setBrush(gradient)
+                bar_set.setBorderColor(QColor("#5dade2"))
+            elif p > 0.1:
+                # Оранжевый градиент для средних значений
+                gradient = QLinearGradient(0, 0, 0, 400)
+                gradient.setColorAt(0, QColor("#f39c12"))
+                gradient.setColorAt(1, QColor("#d35400"))
+                bar_set.setBrush(gradient)
+                bar_set.setBorderColor(QColor("#f5b041"))
+            else:
+                # Серый градиент для низких значений
+                gradient = QLinearGradient(0, 0, 0, 400)
+                gradient.setColorAt(0, QColor("#95a5a6"))
+                gradient.setColorAt(1, QColor("#7f8c8d"))
+                bar_set.setBrush(gradient)
+                bar_set.setBorderColor(QColor("#bdc3c7"))
+            # ================================================
+            series.append(bar_set)
+        chart.addSeries(series)
+
+        # Настройка осей
+        categories = [str(i) for i in range(len(probabilities))]
+        axis_x = QBarCategoryAxis()
+        axis_x.append(categories)
+        axis_x.setLabelsFont(QFont("Arial", 11, QFont.Bold))
+        axis_x.setLabelsBrush(QColor("#ecf0f1"))
+        axis_x.setTitleText("Цифры")
+        axis_x.setTitleFont(QFont("Arial", 12, QFont.Bold))
+        axis_x.setTitleBrush(QColor("#3498db"))
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+
+        axis_y = QValueAxis()
+        axis_y.setRange(0, 1)
+        axis_y.setTickCount(6)
+        axis_y.setLabelsFont(QFont("Arial", 10))
+        axis_y.setLabelsBrush(QColor("#ecf0f1"))
+        axis_y.setTitleText("Вероятность")
+        axis_y.setTitleFont(QFont("Arial", 12, QFont.Bold))
+        axis_y.setTitleBrush(QColor("#3498db"))
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+
+        chart.legend().setVisible(True)
+        chart.legend().setLabelBrush(QColor("#ecf0f1"))
+        chart.legend().setFont(QFont("Arial", 11, QFont.Bold))
+        chart.legend().setAlignment(Qt.AlignBottom)
+
+        # Создаем виджет графика
+        chart_view = QChartView(chart)
+        chart_view.setRenderHint(QPainter.Antialiasing)
+        # === Улучшенный декор для области графика ===
+        chart_view.setStyleSheet("""
+            QChartView {
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 10px;
+                border: 2px solid #34495e;
+                padding: 10px;
+                /* Добавляем эффект тени */
+                border-image: url(:/border_shadow.png) 0 0 0 0 stretch stretch;
+            }
+        """)
+        # Добавляем эффект тени для графика
+        shadow_effect = QGraphicsDropShadowEffect()
+        shadow_effect.setBlurRadius(15)
+        shadow_effect.setColor(QColor(0, 0, 0, 100))
+        shadow_effect.setOffset(0, 5)
+        chart_view.setGraphicsEffect(shadow_effect)
+        # =========================================
+        main_layout.addWidget(chart_view)
+
+        # Добавляем информационную панель
+        info_panel = QFrame()
+        info_panel.setStyleSheet("""
+            QFrame {
+                background: rgba(0, 0, 0, 0.3);
+                border-radius: 10px;
+                border: 2px solid #34495e;
+                padding: 15px;
+            }
+        """)
+        info_layout = QVBoxLayout()
+        # Наиболее вероятная цифра
+        max_digit = np.argmax(probabilities)
+        max_prob = probabilities[max_digit]
+        max_label = QLabel(
+            f"Наиболее вероятная цифра: <span style='color: #27ae60; font-weight: bold; font-size: 16px;'>{max_digit}</span> "
+            f"(<span style='color: #3498db; font-weight: bold;'>{max_prob:.1%}</span>)")
+        max_label.setStyleSheet("font-size: 14px;")
+        # Вторая по вероятности
+        sorted_indices = np.argsort(probabilities)[::-1]
+        second_digit = sorted_indices[1] if len(sorted_indices) > 1 else None
+        second_prob = probabilities[second_digit] if second_digit is not None else 0
+        second_label = QLabel(
+            f"Вторая по вероятности: <span style='color: #3498db; font-weight: bold; font-size: 14px;'>{second_digit if second_digit is not None else 'нет'}</span> "
+            f"(<span style='color: #f39c12; font-weight: bold;'>{second_prob:.1%}</span>)" if second_digit is not None else "")
+        second_label.setStyleSheet("font-size: 13px;")
+        info_layout.addWidget(max_label)
+        if second_digit is not None and second_prob > 0.01:
+            info_layout.addWidget(second_label)
+        info_panel.setLayout(info_layout)
+        main_layout.addWidget(info_panel)
+
+        # Кнопка закрытия
+        close_btn = QPushButton("Закрыть")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3498db, stop:1 #2980b9);
+                color: white;
+                border: none;
+                padding: 12px 25px;
+                border-radius: 8px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2980b9, stop:1 #2573a7);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2573a7, stop:1 #1c5a85);
+            }
+        """)
+        close_btn.clicked.connect(self.accept)
+        close_layout = QHBoxLayout()
+        close_layout.addStretch()
+        close_layout.addWidget(close_btn)
+        close_layout.addStretch()
+        main_layout.addLayout(close_layout)
+
+        self.setLayout(main_layout)
+
+# ---------- Preview Dialog ----------
+# Используем улучшенную UI версию из первого файла
+class PreviewDialog(QDialog):
+    def __init__(self, processed_array: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Анализ обработанного изображения")
+        self.resize(380, 480)
+        self.setModal(True)
+        # Стилизация окна
+        self.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2c3e50, stop:1 #1a2530);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #ecf0f1;
+                font-family: "Segoe UI", Arial;
+            }
+        """)
+
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+
+        # Заголовок
+        header = QLabel("Обработанное изображение")
+        header.setStyleSheet("""
+            QLabel {
+                color: #3498db;
+                font-size: 18px;
+                font-weight: bold;
+                padding: 10px;
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 8px;
+            }
+        """)
+        header.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(header)
+
+        # Отображение изображения
+        arr = processed_array.reshape(28, 28)
+        arr_u8 = (arr * 255).astype(np.uint8)
+        h, w = arr_u8.shape
+        img = QImage(arr_u8.data, w, h, w, QImage.Format_Grayscale8).copy()
+        pix = QPixmap.fromImage(img).scaled(280, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        img_label = QLabel()
+        img_label.setPixmap(pix)
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setStyleSheet("""
+            QLabel {
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 8px;
+                border: 1px solid #34495e;
+                padding: 10px;
+            }
+        """)
+        main_layout.addWidget(img_label)
+
+        # Статистика
+        stats = arr_u8.flatten()
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet("""
+            QFrame {
+                background: rgba(0, 0, 0, 0.3);
+                border-radius: 8px;
+                border: 1px solid #34495e;
+                padding: 15px;
+            }
+        """)
+        stats_layout = QVBoxLayout()
+        stats_title = QLabel("Статистика изображения")
+        stats_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #3498db; margin-bottom: 10px;")
+        stats_title.setAlignment(Qt.AlignCenter)
+        stats_label = QLabel(
+            f"<table style='width: 100%;'>"
+            f"<tr><td>Минимальное значение:</td><td align='right'><span style='color: #27ae60;'>{stats.min() / 255:.3f}</span></td></tr>"
+            f"<tr><td>Максимальное значение:</td><td align='right'><span style='color: #e74c3c;'>{stats.max() / 255:.3f}</span></td></tr>"
+            f"<tr><td>Среднее значение:</td><td align='right'><span style='color: #3498db;'>{stats.mean() / 255:.3f}</span></td></tr>"
+            f"<tr><td>Стандартное отклонение:</td><td align='right'><span style='color: #f39c12;'>{stats.std() / 255:.3f}</span></td></tr>"
+            f"</table>"
+        )
+        stats_label.setStyleSheet("font-size: 12px;")
+        stats_layout.addWidget(stats_title)
+        stats_layout.addWidget(stats_label)
+        stats_frame.setLayout(stats_layout)
+        main_layout.addWidget(stats_frame)
+
+        # Кнопка закрытия
+        close_btn = QPushButton("Закрыть")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: #3498db;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #2980b9;
+            }
+            QPushButton:pressed {
+                background: #2573a7;
+            }
+        """)
+        close_btn.clicked.connect(self.accept)
+        close_layout = QHBoxLayout()
+        close_layout.addStretch()
+        close_layout.addWidget(close_btn)
+        close_layout.addStretch()
+        main_layout.addLayout(close_layout)
+
+        self.setLayout(main_layout)
+
+# ---------- Main Window ----------
+class ModernDigitRecognizerMain(QMainWindow):
     def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI Распознавание цифр — QtCharts & Animations")
+        self.setMinimumSize(620, 820)
+        self._load_model()
+        self._init_themes()
+        self.current_theme = "dark"
+        self._build_ui()
+        self.apply_theme(self.current_theme)  # Применяем тему при запуске
 
-        model_loaded = False
+        # храним анимации, overlay и др. (из второго файла)
+        self._theme_overlay = None
+        self._theme_animation_in = None
+        self._theme_animation_out = None
+        self._result_anim = None
+        self._confidence_anim = None
 
+    def _load_model(self):
+        # Используем логику из второго файла
         model_paths = [
             resource_path("resources/models/improved_digit_recognition_model.onnx"),
             "resources/models/improved_digit_recognition_model.onnx",
             "improved_digit_recognition_model.onnx",
         ]
-        for model_path in model_paths:
+        self.model_session = None
+        for p in model_paths:
             try:
-                if os.path.exists(model_path):
-                    print(f"Попытка загрузки ONNX модели: {model_path}")
-
-                    self.model = ort.InferenceSession(model_path, providers=[
-                        'CPUExecutionProvider'])
-                    print(f" ONNX модель загружена: {model_path}")
-                    model_loaded = True
+                if os.path.exists(p):
+                    self.model_session = ort.InferenceSession(p, providers=['CPUExecutionProvider'])
                     break
-                else:
-                    print(f" ONNX модель не найдена: {model_path}")
-            except Exception as e:
-                print(f" Ошибка загрузки ONNX модели {model_path}: {e}")
+            except Exception:
                 continue
-        if not model_loaded:
-            raise FileNotFoundError("Не удалось загрузить ONNX модель нейросети. Проверьте наличие файлов моделей.")
+        if self.model_session is None:
+            raise FileNotFoundError("Не удалось загрузить ONNX модель. Проверьте пути.")
 
-        # Темы
+    def _init_themes(self):
+        # Используем стилизованные темы из первого файла
+        base_font = "Segoe UI, Arial"
         self.themes = {
-            'light': {
-                'bg': '#f0f0f0',
-                'fg': '#2c3e50',
-                'canvas_bg': 'white',
-                'button_bg': '#4a90e2',
-                'clear_bg': '#ff6b6b',
-                'show_bg': '#50c878',
-                'text_secondary': '#7f8c8d',
-                'frame_bg': '#f8f9fa',
-                'border_color': '#2c3e50',
-                'result_text': '#2c3e50',
-                'window_controls': '#e0e0e0',
-                'window_border': '#cccccc'
+            "light": {
+                "qss": f"""
+                    QMainWindow {{
+                        background: #f5f7fa;
+                        border: 2px solid #4a90e2; /* Рамка главного окна */
+                    }}
+                    QWidget {{
+                        background: #f5f7fa;
+                        color: #2c3e50;
+                        font-family: {base_font};
+                    }}
+                    QFrame#panel {{
+                        background: #ffffff;
+                        border-radius: 12px;
+                        border: 1px solid #e4e7eb;
+                    }}
+                    QPushButton {{
+                        background: #4a90e2;
+                        color: white;
+                        border: none;
+                        padding: 10px 16px;
+                        border-radius: 8px;
+                        font-weight: 500;
+                        font-size: 11px;
+                    }}
+                    QPushButton:hover {{
+                        background: #3a7bc8;
+                    }}
+                    QPushButton:pressed {{
+                        background: #2a6bb8;
+                    }}
+                    QPushButton#accent {{
+                        background: #50c878;
+                    }}
+                    QPushButton#accent:hover {{
+                        background: #42b366;
+                    }}
+                    QPushButton#danger {{
+                        background: #ff6b6b;
+                    }}
+                    QPushButton#danger:hover {{
+                        background: #e55a5a;
+                    }}
+                    QPushButton#theme {{
+                        background: #9b59b6;
+                    }}
+                    QPushButton#theme:hover {{
+                        background: #8e44ad;
+                    }}
+                    QSlider::groove:horizontal {{
+                        background: #e9eef6;
+                        height: 8px;
+                        border-radius: 4px;
+                    }}
+                    QSlider::handle:horizontal {{
+                        background: #4a90e2;
+                        width: 16px;
+                        border-radius: 8px;
+                        margin: -4px 0;
+                    }}
+                    QSlider::handle:horizontal:hover {{
+                        background: #3a7bc8;
+                    }}
+                    QLabel#title {{
+                        font-size: 20px;
+                        font-weight: 700;
+                    }}
+                    QLabel#subtitle {{
+                        color: #7f8c8d;
+                        font-size: 13px;
+                    }}
+                    QProgressBar {{
+                        background: #eceff1;
+                        border-radius: 8px;
+                        height: 16px;
+                        text-align: center;
+                        border: none;
+                        font-size: 10px;
+                    }}
+                    QProgressBar::chunk {{
+                        background: #4a90e2;
+                        border-radius: 8px;
+                    }}
+                    QFrame {{
+                        border: none;
+                    }}
+                    QGroupBox {{
+                        font-weight: bold;
+                        border: 1px solid #dcdcdc;
+                        border-radius: 8px;
+                        margin-top: 1ex;
+                        padding-top: 10px;
+                    }}
+                    QGroupBox::title {{
+                        subline: 0;
+                        left: 10px;
+                        padding: 0 5px 0 5px;
+                    }}
+                    QDialog {{
+                        background: #ffffff;
+                    }}
+                """,
+                "border_color": "#4a90e2"  # Цвет рамки для темы
             },
-            'dark': {
-                'bg': '#2c3e50',
-                'fg': '#ecf0f1',
-                'canvas_bg': '#34495e',
-                'button_bg': '#3498db',
-                'clear_bg': '#e74c3c',
-                'show_bg': '#27ae60',
-                'text_secondary': '#bdc3c7',
-                'frame_bg': '#34495e',
-                'border_color': '#ecf0f1',
-                'result_text': '#ecf0f1',
-                'window_controls': '#3c4e60',
-                'window_border': '#1a2530'
+            "dark": {
+                "qss": f"""
+                    QMainWindow {{
+                        background: #1f2d3a;
+                        border: 2px solid #3498db; /* Рамка главного окна */
+                    }}
+                    QWidget {{
+                        background: #1f2d3a;
+                        color: #ecf0f1;
+                        font-family: {base_font};
+                    }}
+                    QMainWindow {{
+                        background: #1f2d3a;
+                    }}
+                    QFrame#panel {{
+                        background: #2b3b47;
+                        border-radius: 12px;
+                        border: 1px solid #30424f;
+                    }}
+                    QPushButton {{
+                        background: #3498db;
+                        color: white;
+                        border: none;
+                        padding: 10px 16px;
+                        border-radius: 8px;
+                        font-weight: 500;
+                        font-size: 11px;
+                    }}
+                    QPushButton:hover {{
+                        background: #2980b9;
+                    }}
+                    QPushButton:pressed {{
+                        background: #2573a7;
+                    }}
+                    QPushButton#accent {{
+                        background: #27ae60;
+                    }}
+                    QPushButton#accent:hover {{
+                        background: #229954;
+                    }}
+                    QPushButton#danger {{
+                        background: #e74c3c;
+                    }}
+                    QPushButton#danger:hover {{
+                        background: #c0392b;
+                    }}
+                    QPushButton#theme {{
+                        background: #9b59b6;
+                    }}
+                    QPushButton#theme:hover {{
+                        background: #8e44ad;
+                    }}
+                    QSlider::groove:horizontal {{
+                        background: #2e3a46;
+                        height: 8px;
+                        border-radius: 4px;
+                    }}
+                    QSlider::handle:horizontal {{
+                        background: #3498db;
+                        width: 16px;
+                        border-radius: 8px;
+                        margin: -4px 0;
+                    }}
+                    QSlider::handle:horizontal:hover {{
+                        background: #2980b9;
+                    }}
+                    QLabel#title {{
+                        font-size: 20px;
+                        font-weight: 700;
+                    }}
+                    QLabel#subtitle {{
+                        color: #bdc3c7;
+                        font-size: 13px;
+                    }}
+                    QProgressBar {{
+                        background: #2a3a45;
+                        border-radius: 8px;
+                        height: 16px;
+                        text-align: center;
+                        border: none;
+                        font-size: 10px;
+                    }}
+                    QProgressBar::chunk {{
+                        background: #27ae60;
+                        border-radius: 8px;
+                    }}
+                    QFrame {{
+                        border: none;
+                    }}
+                    QGroupBox {{
+                        font-weight: bold;
+                        border: 1px solid #3a4b5c;
+                        border-radius: 8px;
+                        margin-top: 1ex;
+                        padding-top: 10px;
+                    }}
+                    QGroupBox::title {{
+                        subline: 0;
+                        left: 10px;
+                        padding: 0 5px 0 5px;
+                    }}
+                    QDialog {{
+                        background: #2b3b47;
+                    }}
+                """,
+                "border_color": "#3498db"  # Цвет рамки для темы
             },
-            'blue': {
-                'bg': '#1e3d59',
-                'fg': '#ffffff',
-                'canvas_bg': '#2a4d69',
-                'button_bg': '#4abdac',
-                'clear_bg': '#ff6b6b',
-                'show_bg': '#4ecdc4',
-                'text_secondary': '#d4e6f1',
-                'frame_bg': '#2a4d69',
-                'border_color': '#4abdac',
-                'result_text': '#ffffff',
-                'window_controls': '#2d5d79',
-                'window_border': '#152a3d'
+            "blue": {
+                "qss": f"""
+                    QMainWindow {{
+                        background: #0f2b3d;
+                        border: 2px solid #4abdac; /* Рамка главного окна */
+                    }}
+                    QWidget {{
+                        background: #0f2b3d;
+                        color: #e6f2f7;
+                        font-family: {base_font};
+                    }}
+                    QMainWindow {{
+                        background: #0f2b3d;
+                    }}
+                    QFrame#panel {{
+                        background: #153847;
+                        border-radius: 12px;
+                        border: 1px solid #1e4054;
+                    }}
+                    QPushButton {{
+                        background: #4abdac;
+                        color: #01303a;
+                        border: none;
+                        padding: 10px 16px;
+                        border-radius: 8px;
+                        font-weight: 500;
+                        font-size: 11px;
+                    }}
+                    QPushButton:hover {{
+                        background: #3d9d9c;
+                    }}
+                    QPushButton:pressed {{
+                        background: #358a89;
+                    }}
+                    QPushButton#accent {{
+                        background: #4ecdc4;
+                        color: #01303a;
+                    }}
+                    QPushButton#accent:hover {{
+                        background: #3db9b0;
+                    }}
+                    QPushButton#danger {{
+                        background: #ff6b6b;
+                        color: #01303a;
+                    }}
+                    QPushButton#danger:hover {{
+                        background: #e55a5a;
+                    }}
+                    QPushButton#theme {{
+                        background: #9b59b6;
+                        color: white;
+                    }}
+                    QPushButton#theme:hover {{
+                        background: #8e44ad;
+                    }}
+                    QSlider::groove:horizontal {{
+                        background: #123744;
+                        height: 8px;
+                        border-radius: 4px;
+                    }}
+                    QSlider::handle:horizontal {{
+                        background: #4abdac;
+                        width: 16px;
+                        border-radius: 8px;
+                        margin: -4px 0;
+                    }}
+                    QSlider::handle:horizontal:hover {{
+                        background: #3d9d9c;
+                    }}
+                    QLabel#title {{
+                        font-size: 20px;
+                        font-weight: 700;
+                    }}
+                    QLabel#subtitle {{
+                        color: #d4e6f1;
+                        font-size: 13px;
+                    }}
+                    QProgressBar {{
+                        background: #163345;
+                        border-radius: 8px;
+                        height: 16px;
+                        text-align: center;
+                        border: none;
+                        font-size: 10px;
+                    }}
+                    QProgressBar::chunk {{
+                        background: #4abdac;
+                        border-radius: 8px;
+                    }}
+                    QFrame {{
+                        border: none;
+                    }}
+                    QGroupBox {{
+                        font-weight: bold;
+                        border: 1px solid #1e4054;
+                        border-radius: 8px;
+                        margin-top: 1ex;
+                        padding-top: 10px;
+                    }}
+                    QGroupBox::title {{
+                        subline: 0;
+                        left: 10px;
+                        padding: 0 5px 0 5px;
+                    }}
+                    QDialog {{
+                        background: #153847;
+                    }}
+                """,
+                "border_color": "#4abdac"  # Цвет рамки для темы
             }
         }
 
-        self.current_theme = 'light'
-        self.theme_transition_active = False
-        self.is_fullscreen = False
+    def _build_ui(self):
+        # Используем UI структуру из первого файла
+        central = QWidget()
+        main_layout = QVBoxLayout()
+        main_layout.setAlignment(Qt.AlignTop)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
 
-        # Создаем главное окно
-        self.root = tk.Tk()
-        self.root.title("🧠 AI Распознавание рукописных цифр")
-        self.root.geometry("450x700")
-        self.root.configure(bg=self.themes[self.current_theme]['bg'])
-        self.root.minsize(400, 600)
+        # Header
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_container = QVBoxLayout()
+        title_container.setSpacing(4)
+        title_label = QLabel("Распознавание цифр")
+        title_label.setObjectName("title")
+        subtitle = QLabel("Нарисуйте цифру в поле ниже")
+        subtitle.setObjectName("subtitle")
+        title_container.addWidget(title_label)
+        title_container.addWidget(subtitle)
+        header.addLayout(title_container)
+        header.addStretch()
+        btn_theme = QPushButton("Тема")
+        btn_theme.setObjectName("theme")
+        btn_theme.setFixedWidth(90)
+        btn_theme.clicked.connect(self._cycle_theme)
+        btn_full = QPushButton("Полный экран")
+        btn_full.setFixedWidth(130)
+        btn_full.clicked.connect(self._toggle_fullscreen)
+        header.addWidget(btn_theme)
+        header.addWidget(btn_full)
+        main_layout.addLayout(header)
 
-        # Теперь можно создавать переменные Tkinter
-        self.brush_size = tk.DoubleVar(value=12)
+        # Panel
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel_layout = QVBoxLayout()
+        panel_layout.setContentsMargins(16, 16, 16, 16)
+        panel_layout.setSpacing(15)
 
-        # Создаем изображение для рисования
-        self.image = Image.new("L", (280, 280), 255)  # белый фон
-        self.draw = ImageDraw.Draw(self.image)
+        # Canvas group
+        canvas_group = QGroupBox("Холст для рисования")
+        canvas_layout = QHBoxLayout()
+        canvas_layout.setSpacing(20)
+        self.drawing = DrawingWidget(size=340, brush=16)
+        canvas_layout.addWidget(self.drawing)
 
-        # Хранение предыдущей точки для рисования линии
-        self.last_x, self.last_y = None, None
+        # Controls group
+        controls_group = QGroupBox("Управление")
+        controls_layout = QVBoxLayout()
+        controls_layout.setSpacing(12)
 
-        # Оптимизация
-        self.debounce_timer = None
-        self.tooltip = None
+        # Brush size control
+        brush_container = QVBoxLayout()
+        brush_container.setSpacing(6)
+        brush_label = QLabel("Размер кисти")
+        brush_label.setAlignment(Qt.AlignCenter)
+        self.slider_brush = QSlider(Qt.Horizontal)
+        self.slider_brush.setMinimum(2)
+        self.slider_brush.setMaximum(40)
+        self.slider_brush.setValue(16)
+        self.slider_brush.setFixedWidth(180)
+        self.slider_brush.valueChanged.connect(lambda v: self.drawing.set_brush(v))
 
-        # История предсказаний
-        self.prediction_history = []
+        # Brush size display
+        self.brush_size_label = QLabel("16")
+        self.brush_size_label.setAlignment(Qt.AlignCenter)
+        self.brush_size_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        brush_container.addWidget(brush_label)
+        brush_container.addWidget(self.slider_brush)
+        brush_container.addWidget(self.brush_size_label)
+        controls_layout.addLayout(brush_container)
 
-        # Создаем интерфейс
-        self.create_ui()
+        # Action buttons
+        buttons_layout = QVBoxLayout()
+        buttons_layout.setSpacing(8)
+        btn_predict = QPushButton("Распознать (Enter/Пробел)")
+        btn_predict.clicked.connect(self._predict)
+        btn_predict.setObjectName("accent")
+        btn_preview = QPushButton("Предпросмотр")
+        btn_preview.clicked.connect(self._show_preview)
+        btn_probs = QPushButton("Вероятности")
+        btn_probs.clicked.connect(self._show_probabilities)
+        btn_clear = QPushButton("Очистить (Ctrl+C)")
+        btn_clear.setObjectName("danger")
+        btn_clear.clicked.connect(self._clear_canvas)
+        buttons_layout.addWidget(btn_predict)
+        buttons_layout.addWidget(btn_preview)
+        buttons_layout.addWidget(btn_probs)
+        buttons_layout.addWidget(btn_clear)
+        controls_layout.addLayout(buttons_layout)
+        controls_layout.addStretch()
+        controls_group.setLayout(controls_layout)
+        canvas_layout.addWidget(controls_group)
+        canvas_group.setLayout(canvas_layout)
+        panel_layout.addWidget(canvas_group)
 
-        # Подключаем события
-        self.bind_events()
+        # Result group
+        result_group = QGroupBox("Результаты")
+        result_layout = QVBoxLayout()
+        result_layout.setSpacing(10)
+        self.result_label = QLabel("Готов к распознаванию...")
+        font = QFont()
+        font.setPointSize(18)
+        font.setBold(True)
+        self.result_label.setFont(font)
+        self.result_label.setAlignment(Qt.AlignCenter)
+        self.result_label.setFixedHeight(50)
+        self.result_label.setStyleSheet("color: #3498db;")
+        self.result_opacity = QGraphicsOpacityEffect()
+        self.result_label.setGraphicsEffect(self.result_opacity)
+        self.result_opacity.setOpacity(1.0)
 
-        # Применяем начальную тему
-        self.apply_theme()
+        self.details_label = QLabel("")
+        self.details_label.setAlignment(Qt.AlignCenter)
+        self.details_label.setWordWrap(True)
+        self.details_label.setStyleSheet("font-size: 12px;")
 
-    def create_ui(self):
-        """Создание пользовательского интерфейса"""
-        # Заголовок с переключателем темы
-        header_frame = tk.Frame(self.root, bg=self.themes[self.current_theme]['bg'])
-        header_frame.pack(pady=10, padx=20, fill='x')
+        self.confidence_bar = QProgressBar()
+        self.confidence_bar.setRange(0, 100)
+        self.confidence_bar.setValue(0)
+        self.confidence_bar.setTextVisible(True)
+        self.confidence_bar.setFixedHeight(20)
+        self.confidence_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #34495e;
+                border-radius: 10px;
+                text-align: center;
+                background: #2c3e50;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #27ae60, stop:1 #2ecc71);
+                border-radius: 9px;
+            }
+        """)
 
-        title_frame = tk.Frame(header_frame, bg=self.themes[self.current_theme]['bg'])
-        title_frame.pack(side=tk.LEFT)
+        result_layout.addWidget(self.result_label)
+        result_layout.addWidget(self.details_label)
+        result_layout.addWidget(self.confidence_bar)
+        result_group.setLayout(result_layout)
+        panel_layout.addWidget(result_group)
+        panel.setLayout(panel_layout)
+        main_layout.addWidget(panel)
 
-        title_label = tk.Label(
-            title_frame,
-            text="🧠 Распознавание цифр",
-            font=("Segoe UI", 16, "bold"),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['fg']
-        )
-        title_label.pack(anchor='w')
+        # Status bar with tips
+        tips = QLabel(
+            "Советы: Рисуйте четкие цифры по центру. Ctrl+R: Распознать | Ctrl+T: Сменить тему | F11: Полный экран")
+        tips.setObjectName("subtitle")
+        tips.setWordWrap(True)
+        tips.setAlignment(Qt.AlignCenter)
+        tips.setStyleSheet(
+            "padding: 10px; background: rgba(52, 152, 219, 0.1); border-radius: 6px; border: 1px solid #3498db;")
+        main_layout.addWidget(tips)
 
-        subtitle_label = tk.Label(
-            title_frame,
-            text="Нарисуйте цифру в поле ниже",
-            font=("Segoe UI", 10),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['text_secondary']
-        )
-        subtitle_label.pack(anchor='w')
+        central.setLayout(main_layout)
+        self.setCentralWidget(central)
 
-        # Переключатель темы и полноэкранный режим
-        control_frame = tk.Frame(header_frame, bg=self.themes[self.current_theme]['bg'])
-        control_frame.pack(side=tk.RIGHT)
+        # Keyboard shortcuts
+        QShortcut(QKeySequence("Ctrl+C"), self, activated=self._clear_canvas)
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._predict)
+        QShortcut(QKeySequence("Ctrl+P"), self, activated=self._show_preview)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self._cycle_theme)
+        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key_Return), self, activated=self._predict)
+        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._predict)
 
-        # Кнопка полноэкранного режима
-        fullscreen_label = tk.Label(
-            control_frame,
-            text="⬜",
-            font=("Segoe UI", 12),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['fg'],
-            cursor="hand2"
-        )
-        fullscreen_label.pack(side=tk.LEFT, padx=5)
-        fullscreen_label.bind("<Button-1>", self.toggle_fullscreen)
-        self.fullscreen_label = fullscreen_label
-        self.create_tooltip(fullscreen_label, "Полноэкранный режим (F11)")
+        # Update brush size label when slider changes
+        self.slider_brush.valueChanged.connect(self._update_brush_size_label)
+        self.last_prediction: Optional[np.ndarray] = None
+        self.busy_progress = QProgressBar()
+        self.busy_progress.setRange(0, 0)
+        self.busy_progress.setVisible(False)
+        self.busy_progress.setFixedHeight(16)
+        main_layout.addWidget(self.busy_progress)
 
-        # Переключатель темы
-        theme_label = tk.Label(
-            control_frame,
-            text="🌙",
-            font=("Segoe UI", 14),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['fg'],
-            cursor="hand2"
-        )
-        theme_label.pack(side=tk.LEFT)
-        theme_label.bind("<Button-1>", self.toggle_theme)
-        self.theme_label = theme_label
-        self.create_tooltip(theme_label, "Переключить тему (Ctrl+T)")
+    def _update_brush_size_label(self, value):
+        self.brush_size_label.setText(str(value))
 
-        # Слайдер размера кисти
-        brush_frame = tk.Frame(self.root, bg=self.themes[self.current_theme]['bg'])
-        brush_frame.pack(pady=5, padx=20, fill='x')
+    def apply_theme(self, theme_name: str):
+        # Используем логику из второго файла, но стили из первого
+        theme_data = self.themes.get(theme_name, {})
+        qss = theme_data.get("qss", "")
+        self.setStyleSheet(qss)
+        self.current_theme = theme_name
 
-        brush_label = tk.Label(brush_frame, text="🎨 Размер кисти:",
-                               font=("Segoe UI", 9),
-                               bg=self.themes[self.current_theme]['bg'],
-                               fg=self.themes[self.current_theme]['fg'])
-        brush_label.pack(side=tk.LEFT)
-        self.create_tooltip(brush_label, "Используйте колесо мыши или стрелки ↑↓")
-
-        brush_slider = tk.Scale(
-            brush_frame,
-            from_=2,
-            to=20,
-            orient=tk.HORIZONTAL,
-            variable=self.brush_size,
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['fg'],
-            highlightthickness=0,
-            length=100,
-            font=("Segoe UI", 8),
-            cursor="hand2"
-        )
-        brush_slider.pack(side=tk.LEFT, padx=10)
-
-        # Холст для рисования с рамкой
-        canvas_frame = tk.Frame(
-            self.root,
-            bg=self.themes[self.current_theme]['border_color'],
-            bd=2,
-            relief='solid'
-        )
-        canvas_frame.pack(pady=10, padx=20)
-
-        self.canvas = tk.Canvas(
-            canvas_frame,
-            width=280,
-            height=280,
-            bg=self.themes[self.current_theme]['canvas_bg'],
-            cursor="cross",
-            highlightthickness=0
-        )
-        self.canvas.pack(padx=2, pady=2)
-
-        # Панель кнопок
-        button_frame = tk.Frame(self.root, bg=self.themes[self.current_theme]['bg'])
-        button_frame.pack(pady=15)
-
-        # Кнопки с улучшенным дизайном
-        self.clear_button = self.create_feedback_button(
-            button_frame,
-            "🧹 Очистить",
-            self.clear_canvas,
-            self.themes[self.current_theme]['clear_bg']
-        )
-        self.clear_button.pack(side=tk.LEFT, padx=5)
-        self.create_tooltip(self.clear_button, "Очистить холст (Ctrl+C или Delete)")
-
-        self.predict_button = self.create_feedback_button(
-            button_frame,
-            "🔍 Распознать",
-            self.predict_digit,
-            self.themes[self.current_theme]['button_bg']
-        )
-        self.predict_button.pack(side=tk.LEFT, padx=5)
-        self.create_tooltip(self.predict_button, "Распознать цифру (Ctrl+R или Enter)")
-
-        self.show_image_button = self.create_feedback_button(
-            button_frame,
-            "🖼️ Показать",
-            self.show_processed_image,
-            self.themes[self.current_theme]['show_bg']
-        )
-        self.show_image_button.pack(side=tk.LEFT, padx=5)
-        self.create_tooltip(self.show_image_button, "Показать обработанное изображение (Ctrl+P)")
-
-        # Кнопка показа вероятностей
-        self.probability_button = self.create_feedback_button(
-            button_frame,
-            "📈 Вероятности",
-            self.show_probability_chart,
-            self.themes[self.current_theme]['button_bg']
-        )
-        self.probability_button.pack(side=tk.LEFT, padx=5)
-        self.create_tooltip(self.probability_button, "Показать вероятности предсказаний")
-
-        # Панель результатов с деталями
-        self.result_frame = tk.Frame(self.root, bg=self.themes[self.current_theme]['bg'])
-        self.result_frame.pack(pady=10, padx=20, fill='x')
-
-        # Основной результат
-        self.result_label = tk.Label(
-            self.result_frame,
-            text="Готов к распознаванию...",
-            font=("Segoe UI", 14, "bold"),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['result_text']
-        )
-        self.result_label.pack(pady=5)
-
-        # Детали результата
-        self.details_label = tk.Label(
-            self.result_frame,
-            text="",
-            font=("Segoe UI", 10),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['text_secondary']
-        )
-        self.details_label.pack()
-
-        # Индикатор уверенности
-        self.confidence_frame = tk.Frame(self.result_frame, bg=self.themes[self.current_theme]['bg'])
-        self.confidence_frame.pack(pady=5)
-
-        self.confidence_label = tk.Label(
-            self.confidence_frame,
-            text="",
-            font=("Segoe UI", 9),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['fg']
-        )
-        self.confidence_label.pack()
-
-        self.confidence_canvas = tk.Canvas(
-            self.confidence_frame,
-            width=200,
-            height=15,
-            bg=self.themes[self.current_theme]['frame_bg'],
-            highlightthickness=0
-        )
-        self.confidence_canvas.pack()
-
-        # Прогресс бар с текстом
-        progress_container = tk.Frame(self.result_frame, bg=self.themes[self.current_theme]['bg'])
-        progress_container.pack(pady=5)
-
-        self.progress_text = tk.Label(
-            progress_container,
-            text="",
-            font=("Segoe UI", 9),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['text_secondary']
-        )
-        self.progress_text.pack()
-
-        self.progress = ttk.Progressbar(
-            progress_container,
-            mode='indeterminate',
-            length=200
-        )
-        self.progress.pack()
-
-        # Информационная панель
-        info_frame = tk.Frame(self.root, bg=self.themes[self.current_theme]['bg'])
-        info_frame.pack(pady=10, padx=20, fill='x')
-
-        info_label = tk.Label(
-            info_frame,
-            text="💡 Совет: Рисуйте четкие цифры по центру",
-            font=("Segoe UI", 9),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['text_secondary']
-        )
-        info_label.pack()
-
-        # Горячие клавиши информация
-        hotkeys_label = tk.Label(
-            info_frame,
-            text="⌨️ Ctrl+C: Очистить | Ctrl+R: Распознать | Ctrl+P: Показать | Ctrl+T: Тема | F11: Полный экран",
-            font=("Segoe UI", 8),
-            bg=self.themes[self.current_theme]['bg'],
-            fg=self.themes[self.current_theme]['text_secondary']
-        )
-        hotkeys_label.pack(pady=(5, 0))
-
-    def create_feedback_button(self, parent, text, command, bg_color):
-        """Кнопка с визуальной обратной связью"""
-
-        def on_enter(e):
-            button.config(bg=self.lighten_color(bg_color))
-
-        def on_leave(e):
-            button.config(bg=bg_color)
-
-        def on_click(e):
-            button.config(relief='sunken')
-            self.root.after(100, lambda: button.config(relief='raised'))
-            command()
-
-        button = tk.Button(
-            parent,
-            text=text,
-            font=("Segoe UI", 10, "bold"),
-            width=12,
-            relief='raised',
-            bd=2,
-            fg='white',
-            bg=bg_color,
-            activebackground=self.darken_color(bg_color),
-            activeforeground='white',
-            padx=10,
-            pady=5,
-            cursor='hand2'
-        )
-
-        button.bind("<Enter>", on_enter)
-        button.bind("<Leave>", on_leave)
-        button.bind("<Button-1>", on_click)
-
-        return button
-
-    def lighten_color(self, color):
-        """Осветление цвета"""
-        color_map = {
-            '#4a90e2': '#6bb3ff',
-            '#ff6b6b': '#ff8e8e',
-            '#50c878': '#73ff9b',
-            '#3498db': '#5dade2',
-            '#e74c3c': '#ec7063',
-            '#27ae60': '#2ecc71',
-            '#4abdac': '#5fd3c2'
-        }
-        return color_map.get(color, color)
-
-    def toggle_theme(self, event=None):
-        """Переключение темы с анимацией"""
-        if self.theme_transition_active:
+    def apply_theme_animated(self, theme_name: str, duration: int = 500):
+        """Плавная смена темы: показываем градиентный overlay (от текущ border -> новый border),
+           затем применяем QSS и уходим."""
+        # Используем улучшенную анимацию из второго файла
+        if theme_name == self.current_theme:
             return
 
-        themes_list = list(self.themes.keys())
-        current_index = themes_list.index(self.current_theme)
-        next_index = (current_index + 1) % len(themes_list)
-        next_theme = themes_list[next_index]
-
-        self.animate_theme_transition(self.current_theme, next_theme)
-
-    def toggle_fullscreen(self, event=None):
-        """Переключение полноэкранного режима"""
-        self.is_fullscreen = not self.is_fullscreen
-        self.root.attributes('-fullscreen', self.is_fullscreen)
-
-        # Обновляем иконку
-        if self.is_fullscreen:
-            self.fullscreen_label.config(text="⧉")
-            self.fullscreen_label.config(text="⧉")
-        else:
-            self.fullscreen_label.config(text="⬜")
-
-        # Обновляем подсказку
-        if hasattr(self, 'tooltip') and self.tooltip:
-            self.tooltip.destroy()
-            self.tooltip = None
-
-    def animate_theme_transition(self, from_theme, to_theme, step=0):
-        """Анимация перехода между темами"""
-        self.theme_transition_active = True
-
-        if step > 20:  # Завершаем анимацию
-            self.current_theme = to_theme
-            self.apply_theme()
-            self.theme_transition_active = False
+        # Если уже анимация идёт, не стартуем новую
+        if self._theme_animation_in is not None and self._theme_animation_in.state() == QPropertyAnimation.Running:
             return
 
-        # Интерполируем цвета
-        progress = step / 20.0
+        start_color = self.themes.get(self.current_theme, {}).get("border_color", "#3498db")
+        end_color = self.themes.get(theme_name, {}).get("border_color", "#3498db")
 
-        # Обновляем основное окно
-        bg_color = self.interpolate_color(
-            self.themes[from_theme]['bg'],
-            self.themes[to_theme]['bg'],
-            progress
-        )
-        self.root.configure(bg=bg_color)
+        # Создаём overlay
+        overlay = ThemeTransitionOverlay(self, start_color, end_color)
+        overlay.raise_()
+        self._theme_overlay = overlay
 
-        # Обновляем все фреймы и виджеты
-        self.animate_all_widgets(from_theme, to_theme, progress)
+        # Animate in
+        anim_in = QPropertyAnimation(overlay.graphicsEffect(), b"opacity", self)
+        anim_in.setStartValue(0.0)
+        anim_in.setEndValue(1.0)
+        anim_in.setDuration(duration // 2)
+        anim_in.setEasingCurve(QEasingCurve.InOutCubic)
+        self._theme_animation_in = anim_in
 
-        # Обновляем иконки
-        icons = {'light': '🌙', 'dark': '☀️', 'blue': '🌊'}
-        icon_color = self.interpolate_color(
-            self.themes[from_theme]['fg'],
-            self.themes[to_theme]['fg'],
-            progress
-        )
-        self.theme_label.configure(
-            bg=bg_color,
-            fg=icon_color
-        )
-        self.fullscreen_label.configure(
-            bg=bg_color,
-            fg=icon_color
-        )
+        def on_in_finished():
+            # Применяем тему ровно в момент покрытия экрана
+            self.apply_theme(theme_name)
+            # Анимируем исчезновение overlay
+            anim_out = QPropertyAnimation(overlay.graphicsEffect(), b"opacity", self)
+            anim_out.setStartValue(1.0)
+            anim_out.setEndValue(0.0)
+            anim_out.setDuration(duration // 2)
+            anim_out.setEasingCurve(QEasingCurve.InOutCubic)
+            self._theme_animation_out = anim_out
 
-        # Продолжаем анимацию
-        self.root.after(20, lambda: self.animate_theme_transition(from_theme, to_theme, step + 1))
+            def on_out_finished():
+                try:
+                    overlay.hide()
+                    overlay.setParent(None)
+                except Exception:
+                    pass
+                self._theme_overlay = None
+                self._theme_animation_in = None
+                self._theme_animation_out = None
 
-    def animate_all_widgets(self, from_theme, to_theme, progress):
-        """Полная анимация всех виджетов"""
-        for widget in self.root.winfo_children():
-            self.animate_widget(widget, from_theme, to_theme, progress)
+            anim_out.finished.connect(on_out_finished)
+            anim_out.start()
 
-    def animate_widget(self, widget, from_theme, to_theme, progress):
-        """Анимация отдельного виджета"""
-        if isinstance(widget, tk.Frame):
-            # Анимируем фрейм
-            bg_color = self.interpolate_color(
-                self.themes[from_theme]['bg'],
-                self.themes[to_theme]['bg'],
-                progress
-            )
-            widget.configure(bg=bg_color)
+        anim_in.finished.connect(on_in_finished)
+        anim_in.start()
 
-            # Анимируем дочерние элементы
-            for child in widget.winfo_children():
-                self.animate_widget(child, from_theme, to_theme, progress)
+    def _cycle_theme(self):
+        # Используем улучшенную анимацию из второго файла
+        keys = list(self.themes.keys())
+        idx = keys.index(self.current_theme)
+        idx = (idx + 1) % len(keys)
+        self.apply_theme_animated(keys[idx])
 
-        elif isinstance(widget, tk.Label):
-            # Анимируем надписи
-            self.animate_label(widget, from_theme, to_theme, progress)
-
-        elif isinstance(widget, tk.Button):
-            # Анимируем кнопки
-            self.animate_button(widget, from_theme, to_theme, progress)
-
-        elif isinstance(widget, tk.Scale):
-            # Анимируем слайдеры
-            self.animate_scale(widget, from_theme, to_theme, progress)
-
-        elif isinstance(widget, tk.Canvas):
-            # Анимируем холсты
-            self.animate_canvas(widget, from_theme, to_theme, progress)
-
-    def animate_label(self, label, from_theme, to_theme, progress):
-        """Анимация надписи"""
-        text = label.cget('text')
-        bg_color = self.interpolate_color(
-            self.themes[from_theme]['bg'],
-            self.themes[to_theme]['bg'],
-            progress
-        )
-
-        if 'Распознавание цифр' in text:
-            fg_color = self.interpolate_color(
-                self.themes[from_theme]['fg'],
-                self.themes[to_theme]['fg'],
-                progress
-            )
-        elif any(keyword in text for keyword in ['Нарисуйте цифру', 'Совет:', '⌨️', 'Уровень уверенности:', '📊']):
-            fg_color = self.interpolate_color(
-                self.themes[from_theme]['text_secondary'],
-                self.themes[to_theme]['text_secondary'],
-                progress
-            )
+    def _toggle_fullscreen(self):
+        # Используем логику из второго файла
+        if self.isFullScreen():
+            self.showNormal()
         else:
-            fg_color = self.interpolate_color(
-                self.themes[from_theme]['fg'],
-                self.themes[to_theme]['fg'],
-                progress
-            )
+            self.showFullScreen()
 
-        label.configure(bg=bg_color, fg=fg_color)
+    def _clear_canvas(self):
+        # Используем логику из первого файла
+        self.drawing.clear()
+        self.result_label.setText("Холст очищен. Нарисуйте цифру.")
+        self.result_label.setStyleSheet("color: #3498db;")
+        self.details_label.setText("")
+        self.confidence_bar.setValue(0)
+        self.last_prediction = None
 
-    def animate_button(self, button, from_theme, to_theme, progress):
-        """Анимация кнопки"""
-        # Анимируем фон родительского фрейма
-        parent_bg = self.interpolate_color(
-            self.themes[from_theme]['bg'],
-            self.themes[to_theme]['bg'],
-            progress
-        )
-        button.configure(bg=parent_bg)
-
-        # Для текста кнопки используем цвет фона родительского фрейма
-        button.configure(fg='white')  # Текст остается белым для лучшей читаемости
-
-    def animate_scale(self, scale, from_theme, to_theme, progress):
-        """Анимация слайдера"""
-        bg_color = self.interpolate_color(
-            self.themes[from_theme]['bg'],
-            self.themes[to_theme]['bg'],
-            progress
-        )
-        fg_color = self.interpolate_color(
-            self.themes[from_theme]['fg'],
-            self.themes[to_theme]['fg'],
-            progress
-        )
-        trough_color = self.interpolate_color(
-            self.themes[from_theme]['frame_bg'],
-            self.themes[to_theme]['frame_bg'],
-            progress
-        )
-        scale.configure(bg=bg_color, fg=fg_color, troughcolor=trough_color)
-
-    def animate_canvas(self, canvas, from_theme, to_theme, progress):
-        """Анимация холста"""
-        if canvas == self.canvas:
-            # Основной холст для рисования
-            bg_color = self.interpolate_color(
-                self.themes[from_theme]['canvas_bg'],
-                self.themes[to_theme]['canvas_bg'],
-                progress
-            )
-            canvas.configure(bg=bg_color)
-        elif canvas == self.confidence_canvas:
-            # Холст индикатора уверенности
-            bg_color = self.interpolate_color(
-                self.themes[from_theme]['frame_bg'],
-                self.themes[to_theme]['frame_bg'],
-                progress
-            )
-            canvas.configure(bg=bg_color)
-
-    def interpolate_color(self, color1, color2, factor):
-        """Интерполяция между двумя цветами"""
-        if color1 == color2:
-            return color1
-
-        # Преобразуем цвета в RGB
-        try:
-            r1 = int(color1[1:3], 16)
-            g1 = int(color1[3:5], 16)
-            b1 = int(color1[5:7], 16)
-
-            r2 = int(color2[1:3], 16)
-            g2 = int(color2[3:5], 16)
-            b2 = int(color2[5:7], 16)
-
-            # Интерполируем
-            r = int(r1 + (r2 - r1) * factor)
-            g = int(g1 + (g2 - g1) * factor)
-            b = int(b1 + (b2 - b1) * factor)
-
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except:
-            return color1  # В случае ошибки возвращаем исходный цвет
-
-    def apply_theme(self):
-        """Применение текущей темы ко всем элементам"""
-        theme = self.themes[self.current_theme]
-
-        # Обновляем основное окно
-        self.root.configure(bg=theme['bg'])
-
-        # Обновляем все фреймы и виджеты
-        for widget in self.root.winfo_children():
-            if isinstance(widget, tk.Frame):
-                widget.configure(bg=theme['bg'])
-                for child in widget.winfo_children():
-                    self.update_widget_theme(child, theme)
-
-        # Обновляем холст
-        canvas_frame = self.canvas.master
-        canvas_frame.configure(bg=theme['border_color'])
-        self.canvas.configure(bg=theme['canvas_bg'])
-
-        # Обновляем кнопки
-        buttons_config = [
-            (self.clear_button, theme['clear_bg']),
-            (self.predict_button, theme['button_bg']),
-            (self.show_image_button, theme['show_bg']),
-            (self.probability_button, theme['button_bg'])
-        ]
-
-        for button, color in buttons_config:
-            button.configure(
-                bg=color,
-                activebackground=self.darken_color(color)
-            )
-
-        # Обновляем панель результатов
-        self.result_frame.configure(bg=theme['bg'])
-        self.result_label.configure(
-            bg=theme['bg'],
-            fg=theme['result_text']
-        )
-        self.details_label.configure(
-            bg=theme['bg'],
-            fg=theme['text_secondary']
-        )
-        self.confidence_label.configure(
-            bg=theme['bg'],
-            fg=theme['fg']
-        )
-        self.confidence_canvas.configure(
-            bg=theme['frame_bg']
-        )
-        self.progress_text.configure(
-            bg=theme['bg'],
-            fg=theme['text_secondary']
-        )
-
-        # Обновляем слайдер
-        for widget in self.root.winfo_children():
-            if isinstance(widget, tk.Frame):
-                for child in widget.winfo_children():
-                    if isinstance(child, tk.Scale):
-                        child.configure(
-                            bg=theme['bg'],
-                            fg=theme['fg'],
-                            troughcolor=theme['frame_bg']
-                        )
-
-        # Обновляем иконки
-        icons = {'light': '🌙', 'dark': '☀️', 'blue': '🌊'}
-        self.theme_label.configure(
-            text=icons.get(self.current_theme, '🌙'),
-            bg=theme['bg'],
-            fg=theme['fg']
-        )
-
-        fullscreen_icons = {'normal': '⬜', 'fullscreen': '⧉'}
-        self.fullscreen_label.configure(
-            bg=theme['bg'],
-            fg=theme['fg']
-        )
-
-    def update_widget_theme(self, widget, theme):
-        """Рекурсивное обновление темы для виджета"""
-        if isinstance(widget, tk.Label):
-            if 'Распознавание цифр' in widget.cget('text'):
-                widget.configure(bg=theme['bg'], fg=theme['fg'])
-            elif any(text in widget.cget('text') for text in
-                     ['Нарисуйте цифру', 'Совет:', '⌨️', 'Уровень уверенности:', '📊']):
-                widget.configure(bg=theme['bg'], fg=theme['text_secondary'])
-            else:
-                widget.configure(bg=theme['bg'], fg=theme['fg'])
-        elif isinstance(widget, tk.Frame):
-            widget.configure(bg=theme['bg'])
-            for subchild in widget.winfo_children():
-                self.update_widget_theme(subchild, theme)
-        elif isinstance(widget, tk.Scale):
-            widget.configure(
-                bg=theme['bg'],
-                fg=theme['fg'],
-                troughcolor=theme['frame_bg']
-            )
-        elif isinstance(widget, tk.Canvas):
-            if widget == self.canvas:
-                widget.configure(bg=theme['canvas_bg'])
-            elif widget == self.confidence_canvas:
-                widget.configure(bg=theme['frame_bg'])
-
-    def darken_color(self, color):
-        """Затемнение цвета для activebackground"""
-        color_map = {
-            '#ff6b6b': '#c0392b',  # clear_bg light
-            '#4a90e2': '#2980b9',  # button_bg light
-            '#50c878': '#27ae60',  # show_bg light
-            '#e74c3c': '#c0392b',  # clear_bg dark
-            '#3498db': '#2980b9',  # button_bg dark
-            '#27ae60': '#229954',  # show_bg dark
-            '#4abdac': '#3d9a8d'  # blue theme
-        }
-        return color_map.get(color, color)
-
-    def bind_events(self):
-        """Подключение событий мыши и клавиатуры"""
-        self.canvas.bind("<B1-Motion>", self.draw_digit)
-        self.canvas.bind("<ButtonPress-1>", self.start_draw)
-        self.canvas.bind("<ButtonRelease-1>", self.reset_last_coords)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.clear_canvas())
-        self.canvas.bind("<MouseWheel>", self.change_brush_size)
-
-        # Горячие клавиши
-        self.root.bind("<Control-c>", lambda e: self.clear_canvas())
-        self.root.bind("<Control-r>", lambda e: self.predict_digit())
-        self.root.bind("<Control-p>", lambda e: self.show_processed_image())
-        self.root.bind("<Control-t>", lambda e: self.toggle_theme())
-        self.root.bind("<Delete>", lambda e: self.clear_canvas())
-        self.root.bind("<Return>", lambda e: self.predict_digit())
-        self.root.bind("<space>", lambda e: self.predict_digit())
-        self.root.bind("<Up>", lambda e: self.adjust_brush_size(1))
-        self.root.bind("<Down>", lambda e: self.adjust_brush_size(-1))
-        self.root.bind("<F11>", self.toggle_fullscreen)
-        self.root.bind("<Escape>", lambda e: self.exit_fullscreen())
-
-    def exit_fullscreen(self, event=None):
-        """Выход из полноэкранного режима"""
-        if self.is_fullscreen:
-            self.is_fullscreen = False
-            self.root.attributes('-fullscreen', False)
-            self.fullscreen_label.config(text="⬜")
-
-    def change_brush_size(self, event):
-        """Изменение размера кисти колесом мыши"""
-        delta = 1 if event.delta > 0 else -1
-        current = self.brush_size.get()
-        new_size = max(2, min(20, current + delta))
-        self.brush_size.set(new_size)
-
-    def adjust_brush_size(self, delta):
-        """Изменение размера кисти стрелками"""
-        current = self.brush_size.get()
-        new_size = max(2, min(20, current + delta))
-        self.brush_size.set(new_size)
-
-    def start_draw(self, event):
-        """Начало рисования - устанавливаем первую точку"""
-        self.last_x, self.last_y = event.x, event.y
-
-    def draw_digit(self, event):
-        """Рисование на холсте"""
-        x, y = event.x, event.y
-
-        if self.last_x and self.last_y:
-            # Определяем цвет в зависимости от темы
-            line_color = '#2c3e50' if self.current_theme == 'light' else '#ecf0f1'
-
-            # Рисуем линию на холсте
-            self.canvas.create_line(
-                self.last_x, self.last_y, x, y,
-                fill=line_color,
-                width=self.brush_size.get(),
-                capstyle=tk.ROUND,
-                smooth=True
-            )
-            # Рисуем линию в PIL изображении
-            self.draw.line(
-                [self.last_x, self.last_y, x, y],
-                fill="black",
-                width=int(self.brush_size.get())
-            )
-
-        self.last_x, self.last_y = x, y
-
-    def reset_last_coords(self, event=None):
-        """Сброс координат"""
-        self.last_x, self.last_y = None, None
-
-    def clear_canvas(self):
-        """Очистка холста"""
-        self.canvas.delete("all")
-        self.image.paste(255, (0, 0, 280, 280))
-        self.draw.rectangle([0, 0, 280, 280], fill=255)
-        self.result_label.config(text="Холст очищен. Нарисуйте цифру.")
-        self.details_label.config(text="")
-        self.confidence_label.config(text="")
-        self.confidence_canvas.delete("all")
-        self.result_label.config(fg=self.themes[self.current_theme]['text_secondary'])
-
-    def animate_result(self, text, color, details="", confidence=None):
-        """Плавное изменение текста результата"""
-
-        def update_text(step=0):
-            if step <= len(text):
-                self.result_label.config(text=text[:step], fg=color)
-                self.root.after(20, update_text, step + 1)
-            else:
-                if details:
-                    self.details_label.config(text=details)
-                if confidence is not None:
-                    self.update_confidence_meter(confidence)
-
-        self.result_label.config(text="")
-        self.details_label.config(text="")
-        self.confidence_label.config(text="")
-        self.confidence_canvas.delete("all")
-        update_text()
-
-    def update_confidence_meter(self, confidence):
-        """Обновление индикатора уверенности"""
-        # Текст уверенности
-        self.confidence_label.config(text=f"Уровень уверенности: {confidence:.1%}")
-
-        # Визуальный индикатор
-        self.confidence_canvas.delete("all")
-
-        # Фон
-        self.confidence_canvas.create_rectangle(0, 0, 200, 15,
-                                                fill=self.themes[self.current_theme]['frame_bg'],
-                                                outline="")
-
-        # Заполнение
-        fill_width = int(200 * confidence)
-        color = self.get_confidence_color(confidence)
-
-        if fill_width > 0:
-            self.confidence_canvas.create_rectangle(0, 0, fill_width, 15,
-                                                    fill=color, outline="")
-
-    def get_confidence_color(self, confidence):
-        """Цвет в зависимости от уровня уверенности"""
-        if confidence > 0.8:
-            return '#27ae60'  # Зеленый
-        elif confidence > 0.5:
-            return '#f39c12'  # Оранжевый
-        else:
-            return '#e74c3c'  # Красный
-
-    def show_notification(self, message, duration=2000):
-        """Показ всплывающего уведомления"""
-        notification_frame = tk.Frame(
-            self.root,
-            bg='#3498db',
-            relief='raised',
-            bd=2
-        )
-        notification_frame.place(relx=0.5, rely=0.1, anchor='center')
-
-        tk.Label(
-            notification_frame,
-            text=message,
-            font=("Segoe UI", 10, "bold"),
-            bg='#3498db',
-            fg='white',
-            padx=20,
-            pady=10
-        ).pack()
-
-        self.root.after(duration, notification_frame.destroy)
-
-    def get_best_shift(self, img):
-        """Нахождение центра масс для центрирования"""
+    @staticmethod
+    def get_best_shift(img: np.ndarray) -> Tuple[int, int]:
+        # Используем улучшенную логику из второго файла
         cy, cx = ndimage.center_of_mass(img)
         rows, cols = img.shape
-        shiftx = np.round(cols / 2.0 - cx).astype(int)
-        shifty = np.round(rows / 2.0 - cy).astype(int)
+        shiftx = int(np.round(cols / 2.0 - cx))
+        shifty = int(np.round(rows / 2.0 - cy))
         return shiftx, shifty
 
-    def shift(self, img, sx, sy):
-        """Сдвиг изображения"""
+    @staticmethod
+    def shift(img: np.ndarray, sx: int, sy: int) -> np.ndarray:
+        # Используем улучшенную логику из второго файла
         rows, cols = img.shape
         M = np.float32([[1, 0, sx], [0, 1, sy]])
         shifted = cv2.warpAffine(img, M, (cols, rows))
         return shifted
 
-    def preprocess_image(self):
-        """Предобработка изображения для модели"""
-
-        img_resized = self.image.resize((28, 28))
-        img_array = np.array(img_resized)
-
+    def preprocess_image(self) -> np.ndarray:
+        # Используем улучшенную логику из второго файла
+        pil = self.drawing.get_pil_image()
+        img_resized = pil.resize((28, 28), Image.LANCZOS)
+        img_array = np.array(img_resized).astype(np.uint8)
         img_array = 255 - img_array
-
         img_array = img_array / 255.0
-
         img_pil = Image.fromarray((img_array * 255).astype(np.uint8))
         bbox = ImageOps.invert(img_pil).getbbox()
         if bbox:
             img_cropped = img_pil.crop(bbox)
             img_pil = ImageOps.pad(img_cropped, (28, 28), color=0)
             img_array = np.array(img_pil) / 255.0
-
         shiftx, shifty = self.get_best_shift(img_array)
         img_array = self.shift(img_array, shiftx, shifty)
+        img_array = img_array.reshape(1, 28, 28, 1).astype(np.float32)
+        return img_array
 
-
-        img_array = img_array.reshape(1, 28, 28, 1)
-        return img_array.astype(np.float32)
-
-    def predict_digit(self):
-        """Распознавание цифры с анимацией загрузки"""
-        # Отменяем предыдущий таймер
-        if self.debounce_timer:
-            self.root.after_cancel(self.debounce_timer)
-
-        # Задержка для предотвращения множественных вызовов
-        self.debounce_timer = self.root.after(300, self._perform_prediction)
-
-    def _perform_prediction(self):
-        """Выполнение предсказания с ONNX моделью"""
-
-        def predict_thread():
-            try:
-                self.progress.start()
-                self.progress_text.config(text="🧠 Анализируем изображение...")
-                theme = self.themes[self.current_theme]
-                self.result_label.config(text="Анализ...", fg=theme['button_bg'])
-                self.root.update()
-
-                img_array = self.preprocess_image()
-
-                input_name = self.model.get_inputs()[0].name
-
-                prediction = self.model.run(None, {input_name: img_array})[0][
-                    0]
-
-                predicted_digit = np.argmax(prediction)
-                confidence = np.max(prediction)
-
-                self.last_prediction = prediction
-
-                confidence_color = self.get_confidence_color(confidence)
-                result_text = f"🎯 Результат: {predicted_digit}"
-                details_text = f"Уверенность: {confidence:.1%} | Альтернативы: "
-
-                top_3_indices = np.argsort(prediction)[-3:][::-1]
-                alternatives = [f"{i}: {prediction[i]:.1%}" for i in top_3_indices[1:] if prediction[i] > 0.01]
-                details_text += " | ".join(alternatives) if alternatives else "нет"
-                self.animate_result(result_text, confidence_color, details_text, confidence)
-            except Exception as e:
-                import traceback
-                print(traceback.format_exc())  # Для отладки
-                theme = self.themes[self.current_theme]
-                self.animate_result(f"❌ Ошибка", theme['clear_bg'], str(e))
-            finally:
-                self.progress.stop()
-                self.progress_text.config(text="")
-
-        threading.Thread(target=predict_thread, daemon=True).start()
-
-    def show_probability_chart(self):
-        """Показ диаграммы вероятностей"""
-        if not hasattr(self, 'last_prediction'):
-            messagebox.showinfo("Информация", "Сначала выполните распознавание!")
-            return
-
-        try:
-            prediction = self.last_prediction
-
-            # Создаем новое окно
-            chart_window = tk.Toplevel(self.root)
-            chart_window.title("📈 Вероятности предсказаний")
-            chart_window.geometry("800x600")
-            chart_window.configure(bg=self.themes[self.current_theme]['bg'])
-
-            # Добавляем обводку окна в цвет темы
-            chart_window.configure(highlightbackground=self.themes[self.current_theme]['window_border'])
-            chart_window.configure(highlightthickness=2)
-
-            # Сохраняем ссылку на окно для возможности изменения темы
-            self.probability_window = chart_window
-
-            # Центрируем окно
-            chart_window.transient(self.root)
-            chart_window.grab_set()
-
-            # Создаем панель управления окном
-            self.create_window_controls(chart_window)
-
-            # Заголовок окна
-            title_label = tk.Label(
-                chart_window,
-                text="📈 Вероятности предсказаний нейросети",
-                font=("Segoe UI", 14, "bold"),
-                bg=self.themes[self.current_theme]['bg'],
-                fg=self.themes[self.current_theme]['fg']
-            )
-            title_label.pack(pady=10)
-
-            # Создаем matplotlib фигуру с цветом фона темы
-            fig, ax = plt.subplots(figsize=(10, 6),
-                                   facecolor=self.themes[self.current_theme]['frame_bg'])
-
-            digits = list(range(10))
-            probabilities = [prediction[i] for i in digits]
-
-            # Создаем цветовую палитру
-            colors = []
-            max_prob = max(probabilities)
-            for prob in probabilities:
-                if prob == max_prob:
-                    colors.append('#27ae60')  # Зеленый для максимальной вероятности
-                elif prob > 0.1:
-                    colors.append('#3498db')  # Синий для средних
-                else:
-                    colors.append('#95a5a6')  # Серый для низких
-
-            # Создаем столбчатую диаграмму
-            bars = ax.bar(digits, probabilities, color=colors, alpha=0.8,
-                          edgecolor=self.themes[self.current_theme]['border_color'],
-                          linewidth=1)
-
-            # Настройки диаграммы
-            ax.set_xlabel('Цифры', fontsize=12, color=self.themes[self.current_theme]['fg'])
-            ax.set_ylabel('Вероятность', fontsize=12, color=self.themes[self.current_theme]['fg'])
-            ax.set_title('Вероятности предсказаний', fontsize=14,
-                         color=self.themes[self.current_theme]['fg'], pad=20)
-            ax.set_ylim(0, 1)
-
-            # Добавляем значения на столбцы
-            for i, (bar, prob) in enumerate(zip(bars, probabilities)):
-                height = bar.get_height()
-                if height > 0.01:  # Показываем только значимые значения
-                    ax.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
-                            f'{prob:.1%}',
-                            ha='center', va='bottom',
-                            fontsize=10,
-                            color=self.themes[self.current_theme]['fg'],
-                            weight='bold')
-
-            # Настройка цветов осей и сетки
-            ax.tick_params(colors=self.themes[self.current_theme]['fg'], labelsize=10)
-            ax.spines['bottom'].set_color(self.themes[self.current_theme]['fg'])
-            ax.spines['top'].set_color(self.themes[self.current_theme]['fg'])
-            ax.spines['left'].set_color(self.themes[self.current_theme]['fg'])
-            ax.spines['right'].set_color(self.themes[self.current_theme]['fg'])
-
-            # Добавляем сетку
-            ax.grid(True, alpha=0.3, color=self.themes[self.current_theme]['fg'])
-
-            # Настройка меток по оси X
-            ax.set_xticks(digits)
-            ax.set_xticklabels(digits, color=self.themes[self.current_theme]['fg'])
-
-            # Встраиваем в tkinter
-            canvas = FigureCanvasTkAgg(fig, chart_window)
-            canvas.draw()
-
-            # Добавляем панель информации
-            info_frame = tk.Frame(chart_window, bg=self.themes[self.current_theme]['bg'])
-            info_frame.pack(fill='x', padx=20, pady=10)
-
-            # Информация о максимальной вероятности
-            max_digit = np.argmax(prediction)
-            max_prob = prediction[max_digit]
-            info_text = f"Наиболее вероятная цифра: {max_digit} ({max_prob:.1%})"
-
-            tk.Label(
-                info_frame,
-                text=info_text,
-                font=("Segoe UI", 11, "bold"),
-                bg=self.themes[self.current_theme]['bg'],
-                fg=self.themes[self.current_theme]['fg']
-            ).pack()
-
-            canvas.get_tk_widget().pack(fill='both', expand=True, padx=20, pady=10)
-
-            # Обновляем тему окна
-            self.update_probability_window_theme()
-
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Ошибка при отображении диаграммы: {str(e)}")
-
-    def create_window_controls(self, window):
-        """Создание панели управления окном"""
-        control_frame = tk.Frame(window, bg=self.themes[self.current_theme]['window_controls'],
-                                 height=30)
-        control_frame.pack(fill='x')
-        control_frame.pack_propagate(False)
-
-        # Кнопки управления окном
-        button_frame = tk.Frame(control_frame, bg=self.themes[self.current_theme]['window_controls'])
-        button_frame.pack(side=tk.RIGHT, padx=5)
-
-        # Кнопка свернуть
-        minimize_btn = tk.Button(
-            button_frame,
-            text="−",
-            font=("Arial", 12, "bold"),
-            width=2,
-            height=1,
-            bg=self.themes[self.current_theme]['window_controls'],
-            fg=self.themes[self.current_theme]['fg'],
-            activebackground=self.themes[self.current_theme]['button_bg'],
-            activeforeground='white',
-            relief='flat',
-            bd=0,
-            command=window.iconify
-        )
-        minimize_btn.pack(side=tk.LEFT, padx=2)
-
-        # Кнопка закрыть
-        close_btn = tk.Button(
-            button_frame,
-            text="×",
-            font=("Arial", 12, "bold"),
-            width=2,
-            height=1,
-            bg=self.themes[self.current_theme]['window_controls'],
-            fg=self.themes[self.current_theme]['fg'],
-            activebackground=self.themes[self.current_theme]['clear_bg'],
-            activeforeground='white',
-            relief='flat',
-            bd=0,
-            command=window.destroy
-        )
-        close_btn.pack(side=tk.LEFT, padx=2)
-
-        # Делаем панель перетаскиваемой
-        def start_move(event):
-            window.x = event.x
-            window.y = event.y
-
-        def do_move(event):
-            deltax = event.x - window.x
-            deltay = event.y - window.y
-            x = window.winfo_x() + deltax
-            y = window.winfo_y() + deltay
-            window.geometry(f"+{x}+{y}")
-
-        control_frame.bind("<ButtonPress-1>", start_move)
-        control_frame.bind("<B1-Motion>", do_move)
-
-    def update_probability_window_theme(self):
-        """Обновление темы окна вероятностей"""
-        if hasattr(self, 'probability_window') and self.probability_window.winfo_exists():
-            theme = self.themes[self.current_theme]
-            self.probability_window.configure(bg=theme['bg'])
-            self.probability_window.configure(highlightbackground=theme['window_border'])
-
-            # Обновляем все дочерние элементы
-            for widget in self.probability_window.winfo_children():
-                if isinstance(widget, tk.Label):
-                    if 'Вероятности предсказаний' in widget.cget('text') or 'Наиболее вероятная' in widget.cget('text'):
-                        widget.configure(bg=theme['bg'], fg=theme['fg'])
-                    else:
-                        widget.configure(bg=theme['bg'], fg=theme['fg'])
-                elif isinstance(widget, tk.Frame):
-                    widget.configure(bg=theme['bg'])
-                    # Рекурсивно обновляем дочерние элементы
-                    for child in widget.winfo_children():
-                        if isinstance(child, tk.Label):
-                            child.configure(bg=theme['bg'], fg=theme['fg'])
-                        elif isinstance(child, tk.Button):
-                            child.configure(bg=theme['window_controls'], fg=theme['fg'])
-
-    def show_processed_image(self):
-        """Улучшенный предпросмотр с дополнительной информацией"""
+    def _predict(self):
+        # Используем логику из второго файла
         try:
             img_array = self.preprocess_image()
-
-            preview_window = tk.Toplevel(self.root)
-            preview_window.title("📊 Анализ изображения")
-            preview_window.geometry("400x550")
-            preview_window.configure(bg=self.themes[self.current_theme]['bg'])
-            preview_window.resizable(False, False)
-
-            # Добавляем обводку окна в цвет темы
-            preview_window.configure(highlightbackground=self.themes[self.current_theme]['window_border'])
-            preview_window.configure(highlightthickness=2)
-
-            # Центрируем окно
-            preview_window.transient(self.root)
-            preview_window.grab_set()
-
-            # Заголовок окна
-            tk.Label(
-                preview_window,
-                text="📊 Анализ обработанного изображения",
-                font=("Segoe UI", 12, "bold"),
-                bg=self.themes[self.current_theme]['bg'],
-                fg=self.themes[self.current_theme]['fg']
-            ).pack(pady=10)
-
-            # Создаем matplotlib фигуру
-            fig, ax = plt.subplots(figsize=(3, 3), facecolor=self.themes[self.current_theme]['frame_bg'])
-            ax.imshow(img_array.reshape(28, 28), cmap='gray')
-            ax.set_title("28×28 пикселей", fontsize=10, color=self.themes[self.current_theme]['fg'])
-            ax.axis('off')
-
-            # Настраиваем цвета для matplotlib
-            if self.current_theme == 'dark' or self.current_theme == 'blue':
-                ax.tick_params(colors='white')
-
-            # Встраиваем в tkinter
-            canvas = FigureCanvasTkAgg(fig, preview_window)
-            canvas.draw()
-            canvas.get_tk_widget().pack(pady=10)
-
-            # Информация о предобработке
-            info_frame = tk.Frame(preview_window, bg=self.themes[self.current_theme]['bg'])
-            info_frame.pack(pady=10)
-
-            tk.Label(
-                info_frame,
-                text="✓ Изменение размера до 28×28\n✓ Центрирование по массе\n✓ Нормализация значений",
-                font=("Segoe UI", 9),
-                bg=self.themes[self.current_theme]['bg'],
-                fg=self.themes[self.current_theme]['text_secondary'],
-                justify='left'
-            ).pack()
-
-            # Статистика изображения
-            stats_frame = tk.Frame(preview_window, bg=self.themes[self.current_theme]['bg'])
-            stats_frame.pack(pady=10)
-
-            img_stats = img_array.flatten()
-            tk.Label(
-                stats_frame,
-                text=f"📊 Статистика:\n"
-                     f"Мин. значение: {img_stats.min():.3f}\n"
-                     f"Макс. значение: {img_stats.max():.3f}\n"
-                     f"Среднее: {img_stats.mean():.3f}\n"
-                     f"Стандартное отклонение: {img_stats.std():.3f}",
-                font=("Segoe UI", 9),
-                bg=self.themes[self.current_theme]['bg'],
-                fg=self.themes[self.current_theme]['fg'],
-                justify='left'
-            ).pack()
-
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Ошибка при отображении: {str(e)}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при подготовке изображения:\n{e}")
+            return
+        if self.model_session is None:
+            QMessageBox.critical(self, "Ошибка", "Модель не загружена.")
+            return
+        self.busy_progress.setVisible(True)
+        self.result_label.setText("Анализ...")
+        self.result_label.setStyleSheet("color: #f39c12;")
+        self.details_label.setText("")
+        self.repaint()
+        self.worker = InferenceWorker(self.model_session, img_array)
+        self.worker.result_ready.connect(self._on_prediction)
+        self.worker.error.connect(self._on_inference_error)
+        self.worker.start()
 
-    def create_tooltip(self, widget, text):
-        """Создание всплывающей подсказки"""
+    def _on_inference_error(self, err: str):
+        # Используем логику из второго файла
+        self.busy_progress.setVisible(False)
+        QMessageBox.critical(self, "Ошибка inference", err)
+        self.result_label.setText("Ошибка")
+        self.result_label.setStyleSheet("color: #e74c3c;")
+        self.details_label.setText(err)
 
-        def on_enter(event):
-            self.tooltip = tk.Toplevel()
-            self.tooltip.wm_overrideredirect(True)
-            self.tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+    def _animate_result_appearance(self):
+        # Используем логику из второго файла
+        anim = QPropertyAnimation(self.result_opacity, b"opacity", self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(280)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start()
+        self._result_anim = anim  # сохранить ссылку
 
-            label = tk.Label(
-                self.tooltip,
-                text=text,
-                background="#ffffe0",
-                relief="solid",
-                borderwidth=1,
-                font=("Segoe UI", 8),
-                padx=5,
-                pady=2
-            )
-            label.pack()
+    def _animate_confidence_bar(self, target_value: int):
+        # Используем логику из второго файла
+        anim = QPropertyAnimation(self.confidence_bar, b"value", self)
+        anim.setStartValue(self.confidence_bar.value())
+        anim.setEndValue(target_value)
+        anim.setDuration(420)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start()
+        self._confidence_anim = anim  # сохранить ссылку
 
-        def on_leave(event):
-            if hasattr(self, 'tooltip') and self.tooltip:
-                self.tooltip.destroy()
-                self.tooltip = None
+    def _on_prediction(self, prediction: np.ndarray):
+        # Используем улучшенную логику из второго файла
+        self.busy_progress.setVisible(False)
+        probs = np.asarray(prediction).astype(np.float32).flatten()
+        if probs.sum() > 0:
+            probs = probs / probs.sum()
+        pred_digit = int(np.argmax(probs))
+        confidence = float(np.max(probs))
+        self.last_prediction = probs
 
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)
+        # Отображаем в одном лейбле цифру и уверенность
+        self.result_label.setText(f"Цифра: {pred_digit}   (Уверенность: {confidence:.1%})")
+        self.result_label.setStyleSheet("color: #27ae60; font-size: 20px; font-weight: bold;")
 
-    def run(self):
-        """Запуск приложения"""
-        # Центрируем окно
-        self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() // 2) - (450 // 2)
-        y = (self.root.winfo_screenheight() // 2) - (700 // 2)
-        self.root.geometry(f"450x700+{x}+{y}")
+        # Топ-альтернативы
+        sorted_idx = np.argsort(probs)[::-1]
+        top3 = sorted_idx[:3]
+        alt_list = []
+        for idx in top3:
+            if idx != pred_digit and probs[idx] > 0.005:
+                alt_list.append(f"{idx}: {probs[idx]:.1%}")
+        details_text = ""
+        if alt_list:
+            details_text = "Альтернативы: " + "  |  ".join(alt_list)
 
-        self.root.mainloop()
+        # Дополнительно показываем краткую уверенность
+        details_text = f"Уверенность: {confidence:.1%}" + ((" | " + details_text) if details_text else "")
+        self.details_label.setText(details_text)
+        self._animate_result_appearance()
+        self._animate_confidence_bar(int(confidence * 100))
 
+    def _show_probabilities(self):
+        # Используем логику из первого файла
+        if self.last_prediction is None:
+            QMessageBox.information(self, "Информация", "Сначала выполните распознавание!")
+            return
+        dlg = ProbabilityDialog(self.last_prediction, parent=self)
+        dlg.exec()
+
+    def _show_preview(self):
+        # Используем логику из первого файла
+        try:
+            arr = self.preprocess_image()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при предобработке: {e}")
+            return
+        dlg = PreviewDialog(arr, parent=self)
+        dlg.exec()
+
+# ---------- Main ----------
+def main():
+    app = QApplication(sys.argv)
+    try:
+        w = ModernDigitRecognizerMain()
+    except Exception as e:
+        QMessageBox.critical(None, "Ошибка запуска", str(e))
+        raise
+    w.show()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
-    try:
-        app = ModernDigitRecognizer()
-        app.run()
-    except Exception as e:
-        print(f"Ошибка запуска приложения: {e}")
-        import traceback
-
-        traceback.print_exc()
-        import sys
-
-        sys.exit(1)
+    main()
